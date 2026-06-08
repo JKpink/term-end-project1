@@ -398,54 +398,90 @@ def train_collaborative(
             for opt in optimizers:
                 opt.zero_grad()
 
-            texts_a, texts_b = [], []
-            tokens_a_list, tokens_b_list = [], []
+            # ═══════════════════════════════════════════════════════════
+            # Phase 1: Batch Generate Agent A (all B samples at once)
+            # ═══════════════════════════════════════════════════════════
+            prompts_a = [d["prompt_a"] for d in batch]
+            tokenizer.padding_side = "left"
+            inp_a_batch = tokenizer(prompts_a, return_tensors="pt", padding=True).to(device_a)
+            with torch.no_grad():
+                out_a_batch = agents[0].generate(
+                    **inp_a_batch, max_new_tokens=max_new_tokens,
+                    temperature=0.6, do_sample=True, top_p=0.9,
+                )
 
-            # --- Batch generate ---
-            for d in batch:
-                # Agent A
-                inp_a = tokenizer(d["prompt_a"], return_tensors="pt").to(device_a)
-                with torch.no_grad():
-                    out_a = agents[0].generate(
-                        **inp_a, max_new_tokens=max_new_tokens,
-                        temperature=0.6, do_sample=True, top_p=0.9,
-                    )
-                text_a = tokenizer.decode(out_a[0][inp_a.input_ids.shape[1]:], skip_special_tokens=True)
+            # Extract per-sample results from padded batch
+            texts_a = []
+            tokens_a_list = []
+            for i in range(len(batch)):
+                p_len = inp_a_batch.attention_mask[i].sum().item()
+                gen_ids = out_a_batch[i, p_len:]
+                # Trim right-side padding
+                pad_pos = (gen_ids == tokenizer.pad_token_id).nonzero()
+                if len(pad_pos) > 0:
+                    gen_ids = gen_ids[:pad_pos[0].item()]
+
+                text_a = tokenizer.decode(gen_ids, skip_special_tokens=True)
                 texts_a.append(text_a)
-                tokens_a_list.append((inp_a, out_a))
 
-                # Agent B
-                full_b = f"{d['prompt_b']}\n\n[Reference]: {text_a}"
-                inp_b = tokenizer(full_b, return_tensors="pt").to(device_b)
-                with torch.no_grad():
-                    out_b = agents[1].generate(
-                        **inp_b, max_new_tokens=max_new_tokens,
-                        temperature=0.6, do_sample=True, top_p=0.9,
-                    )
-                text_b = tokenizer.decode(out_b[0][inp_b.input_ids.shape[1]:], skip_special_tokens=True)
+                # Per-sample tensors for MAAC update
+                inp_a_i = tokenizer(batch[i]["prompt_a"], return_tensors="pt").to(device_a)
+                out_a_i = torch.cat(
+                    [inp_a_i.input_ids, gen_ids.unsqueeze(0).to(device_a)], dim=1,
+                )
+                tokens_a_list.append((inp_a_i, out_a_i))
+
+            tokenizer.padding_side = "right"
+
+            # ═══════════════════════════════════════════════════════════
+            # Phase 2: Batch Generate Agent B (all B samples at once)
+            # ═══════════════════════════════════════════════════════════
+            full_b_prompts = [
+                f"{d['prompt_b']}\n\n[Reference]: {text_a}"
+                for d, text_a in zip(batch, texts_a)
+            ]
+            tokenizer.padding_side = "left"
+            inp_b_batch = tokenizer(full_b_prompts, return_tensors="pt", padding=True).to(device_b)
+            with torch.no_grad():
+                out_b_batch = agents[1].generate(
+                    **inp_b_batch, max_new_tokens=max_new_tokens,
+                    temperature=0.6, do_sample=True, top_p=0.9,
+                )
+
+            texts_b = []
+            tokens_b_list = []
+            for i in range(len(batch)):
+                p_len = inp_b_batch.attention_mask[i].sum().item()
+                gen_ids = out_b_batch[i, p_len:]
+                pad_pos = (gen_ids == tokenizer.pad_token_id).nonzero()
+                if len(pad_pos) > 0:
+                    gen_ids = gen_ids[:pad_pos[0].item()]
+
+                text_b = tokenizer.decode(gen_ids, skip_special_tokens=True)
                 texts_b.append(text_b)
-                tokens_b_list.append((inp_b, out_b))
 
-            # --- Batch rewards ---
-            rewards = reward_fn(texts_a, texts_b)  # [B]
+                inp_b_i = tokenizer(full_b_prompts[i], return_tensors="pt").to(device_b)
+                out_b_i = torch.cat(
+                    [inp_b_i.input_ids, gen_ids.unsqueeze(0).to(device_b)], dim=1,
+                )
+                tokens_b_list.append((inp_b_i, out_b_i))
+
+            tokenizer.padding_side = "right"
+
+            # ═══════════════════════════════════════════════════════════
+            # Phase 3: Compute rewards
+            # ═══════════════════════════════════════════════════════════
+            rewards = reward_fn(texts_a, texts_b)
             for r in rewards:
                 total_reward += r
 
-            # --- MAAC update: actor + critic loss per sample, then step ---
-
-            for i in range(len(batch)):
-                reward = rewards[i]
-
-                # Agent A update
-                actor_a, critic_a = _maac_update(
-                    agents[0], tokenizer, tokens_a_list[i][0], tokens_a_list[i][1], reward,
-                )
-                # Agent B update
-                actor_b, critic_b = _maac_update(
-                    agents[1], tokenizer, tokens_b_list[i][0], tokens_b_list[i][1], reward,
-                )
-                total_actor_loss += actor_a.item() + actor_b.item()
-                total_critic_loss += critic_a + critic_b
+            # ═══════════════════════════════════════════════════════════
+            # Phase 4: Batched MAAC update (one forward per agent)
+            # ═══════════════════════════════════════════════════════════
+            al_a, cl_a = _maac_update_batch(agents[0], tokenizer, tokens_a_list, rewards)
+            al_b, cl_b = _maac_update_batch(agents[1], tokenizer, tokens_b_list, rewards)
+            total_actor_loss += al_a + al_b
+            total_critic_loss += cl_a + cl_b
 
             # Step after accumulating batch gradients
             for opt in optimizers:
@@ -522,6 +558,83 @@ def _maac_update(agent, tokenizer, inputs, gen_output, reward):
     loss.backward()
 
     return actor_loss.detach(), critic_loss.item()
+
+
+def _maac_update_batch(agent, tokenizer, token_list, rewards):
+    """Batched MAAC update: one forward pass for all B samples.
+
+    token_list: list of (prompt_inputs, gen_output) tuples, one per sample.
+    rewards: list of float rewards, one per sample.
+
+    Returns (avg_actor_loss, avg_critic_loss) as floats.
+    """
+    # Filter out zero-reward samples
+    valid = [(i, r) for i, r in enumerate(rewards) if r != 0]
+    if not valid:
+        return 0.0, 0.0
+
+    device = next(agent.parameters()).device
+    V = len(valid)
+
+    # Gather per-sample lengths
+    p_lens = []
+    c_lens = []
+    for idx, (i, _) in enumerate(valid):
+        inp, out_full = token_list[i]
+        p_lens.append(inp.input_ids.shape[1])
+        c_lens.append(out_full.shape[1] - p_lens[-1])
+
+    max_total = max(p + c for p, c in zip(p_lens, c_lens))
+
+    # Build padded batch [V, max_total]
+    full_ids = torch.full((V, max_total), tokenizer.pad_token_id or 0,
+                          dtype=torch.long, device=device)
+    attn_mask = torch.zeros(V, max_total, dtype=torch.long, device=device)
+
+    for idx, (i, _) in enumerate(valid):
+        inp, out_full = token_list[i]
+        p_len = p_lens[idx]
+        c_len = c_lens[idx]
+        total = p_len + c_len
+        full_ids[idx, :p_len] = inp.input_ids[0]
+        full_ids[idx, p_len:total] = out_full[0, p_len:]
+        attn_mask[idx, :total] = 1
+
+    # ── One forward pass for the whole batch ──
+    out = agent(full_ids, attention_mask=attn_mask, output_values=True)
+
+    # ── Per-sample loss + backward (loss computation is cheap) ──
+    total_actor = 0.0
+    total_critic = 0.0
+    for idx, (i, reward) in enumerate(valid):
+        p_len = p_lens[idx]
+        c_len = c_lens[idx]
+        if c_len == 0:
+            continue
+
+        # Log-probs of completion tokens
+        logits_i = out.logits[idx, p_len - 1 : p_len + c_len - 1, :]
+        log_probs = torch.log_softmax(logits_i, dim=-1)
+        completion_ids = token_list[i][1][0, p_len:].to(device)
+        token_lps = log_probs[range(c_len), completion_ids]
+        seq_log_prob = token_lps.sum()
+
+        # Value mean over completion region
+        values_i = out.values[idx, p_len - 1 : p_len + c_len]
+        v_mean = values_i.mean()
+        advantage = reward - v_mean.detach()
+
+        actor_loss_i = -seq_log_prob * advantage
+        reward_t = torch.tensor(reward, device=device, dtype=v_mean.dtype)
+        critic_loss_i = torch.nn.functional.mse_loss(v_mean, reward_t)
+
+        loss = (actor_loss_i + 0.6 * critic_loss_i) / V
+        loss.backward()
+
+        total_actor += actor_loss_i.detach().item()
+        total_critic += critic_loss_i.item()
+
+    return total_actor / V, total_critic / V
 
 
 # ─── Baseline Inference Functions ──────────────────────────────────
