@@ -28,6 +28,7 @@ try:
     from trl import SFTTrainer
 except ImportError:
     SFTTrainer = None
+from actor_critic import CausalLMWithValueHead
 
 
 # ─── Reward Functions ─────────────────────────────────────────────
@@ -244,6 +245,9 @@ def load_agent_with_lora(
     )
     model = get_peft_model(model, lora_config)
 
+    # Wrap with ValueHead for actor-critic
+    model = CausalLMWithValueHead(model, attach_value_head=True)
+
     return model, tokenizer
 
 
@@ -363,53 +367,98 @@ def train_collaborative(
     ]
 
     os.makedirs(output_dir, exist_ok=True)
-    print(f"Starting collaborative training ({num_epochs} epochs)...")
+
+    # Format all prompts ahead of time
+    formatted_data = []
+    for ex in dataset:
+        formatted_data.append({
+            "prompt_a": formatters[0](ex),
+            "prompt_b": formatters[1](ex),
+        })
+
+    B = 4  # batch size
+    print(f"Starting MAAC training: {num_epochs} epochs, {len(formatted_data)} samples, batch={B}")
 
     for epoch in range(num_epochs):
         total_reward = 0.0
-        for i, example in enumerate(dataset):
-            # Generate from both agents
-            prompt_a = formatters[0](example)
-            prompt_b = formatters[1](example)
+        total_actor_loss = 0.0
+        total_critic_loss = 0.0
+        n_batches = 0
 
-            # Agent A generates
-            inputs_a = tokenizer(prompt_a, return_tensors="pt").to(agents[0].device)
-            with torch.no_grad():
-                out_a = agents[0].generate(
-                    **inputs_a, max_new_tokens=max_new_tokens,
-                    temperature=0.6, do_sample=True, top_p=0.9,
+        for start in range(0, len(formatted_data), B):
+            batch = formatted_data[start:start + B]
+            n_batches += 1
+            # Zero gradients before batch
+            for opt in optimizers:
+                opt.zero_grad()
+
+            texts_a, texts_b = [], []
+            tokens_a_list, tokens_b_list = [], []
+
+            # --- Batch generate ---
+            for d in batch:
+                # Agent A
+                inp_a = tokenizer(d["prompt_a"], return_tensors="pt").to(agents[0].device)
+                with torch.no_grad():
+                    out_a = agents[0].generate(
+                        **inp_a, max_new_tokens=max_new_tokens,
+                        temperature=0.6, do_sample=True, top_p=0.9,
+                    )
+                text_a = tokenizer.decode(out_a[0][inp_a.input_ids.shape[1]:], skip_special_tokens=True)
+                texts_a.append(text_a)
+                tokens_a_list.append((inp_a, out_a))
+
+                # Agent B
+                full_b = f"{d['prompt_b']}\n\n[Reference]: {text_a}"
+                inp_b = tokenizer(full_b, return_tensors="pt").to(agents[1].device)
+                with torch.no_grad():
+                    out_b = agents[1].generate(
+                        **inp_b, max_new_tokens=max_new_tokens,
+                        temperature=0.6, do_sample=True, top_p=0.9,
+                    )
+                text_b = tokenizer.decode(out_b[0][inp_b.input_ids.shape[1]:], skip_special_tokens=True)
+                texts_b.append(text_b)
+                tokens_b_list.append((inp_b, out_b))
+
+            # --- Batch rewards ---
+            rewards = reward_fn(texts_a, texts_b)  # [B]
+            for r in rewards:
+                total_reward += r
+
+            # --- MAAC update: actor + critic loss per sample, then step ---
+            batch_actor = torch.tensor(0.0, requires_grad=True)
+            batch_critic = 0.0
+
+            for i in range(len(batch)):
+                reward = rewards[i]
+
+                # Agent A update
+                actor_a, critic_a = _maac_update(
+                    agents[0], tokenizer, tokens_a_list[i][0], tokens_a_list[i][1], reward,
                 )
-            completion_a = tokenizer.decode(
-                out_a[0][inputs_a.input_ids.shape[1]:], skip_special_tokens=True,
-            )
-
-            # Agent B generates (with access to A's output)
-            full_prompt_b = f"{prompt_b}\n\n[Reference from summarizer]: {completion_a}"
-            inputs_b = tokenizer(full_prompt_b, return_tensors="pt").to(agents[1].device)
-            with torch.no_grad():
-                out_b = agents[1].generate(
-                    **inputs_b, max_new_tokens=max_new_tokens,
-                    temperature=0.6, do_sample=True, top_p=0.9,
+                # Agent B update
+                actor_b, critic_b = _maac_update(
+                    agents[1], tokenizer, tokens_b_list[i][0], tokens_b_list[i][1], reward,
                 )
-            completion_b = tokenizer.decode(
-                out_b[0][inputs_b.input_ids.shape[1]:], skip_special_tokens=True,
-            )
+                batch_actor = batch_actor + actor_a + actor_b
+                total_actor_loss += (actor_a.item() if isinstance(actor_a, torch.Tensor) else actor_a) + \
+                                    (actor_b.item() if isinstance(actor_b, torch.Tensor) else actor_b)
+                total_critic_loss += critic_a + critic_b
 
-            # Compute reward
-            reward = reward_fn([completion_a], [completion_b])[0]
-            total_reward += reward
+            # Step after accumulating batch gradients
+            for opt in optimizers:
+                opt.step()
 
-            # REINFORCE: update Agent A on its own tokens
-            _reinforce_step(agents[0], optimizers[0], tokenizer, inputs_a, out_a, reward)
+            if n_batches % 10 == 0 or start == 0:
+                avg_r = total_reward / ((start / B + 1) * B) if start > 0 else total_reward / len(batch)
+                print(f"  Batch {n_batches}/{len(formatted_data)//B+1}, "
+                      f"reward={sum(rewards)/len(rewards):.2f}, avg_r={avg_r:.3f}", flush=True)
 
-            # REINFORCE: update Agent B on its own tokens
-            _reinforce_step(agents[1], optimizers[1], tokenizer, inputs_b, out_b, reward)
-
-            if (i + 1) % 10 == 0:
-                print(f"  Step {i+1}/{len(dataset)}, avg reward: {total_reward/(i+1):.3f}")
-
-        avg_reward = total_reward / len(dataset)
-        print(f"Epoch {epoch+1}/{num_epochs}: avg_reward = {avg_reward:.4f}")
+        avg_reward = total_reward / len(formatted_data)
+        avg_al = total_actor_loss / max(1, len(formatted_data) * 2)
+        avg_cl = total_critic_loss / max(1, len(formatted_data) * 2)
+        print(f"Epoch {epoch+1}/{num_epochs}: avg_reward={avg_reward:.4f}, "
+              f"actor_loss={avg_al:.4f}, critic_loss={avg_cl:.4f}", flush=True)
 
         # Save checkpoints
         agent_a.save_pretrained(os.path.join(output_dir, f"agent_a_epoch{epoch+1}"))
@@ -424,38 +473,53 @@ def train_collaborative(
     return final_a, final_b
 
 
-# ─── REINFORCE step ────────────────────────────────────────────────
+# ─── MAAC update (actor-critic) ────────────────────────────────────
 
-def _reinforce_step(agent, optimizer, tokenizer, inputs, gen_output, reward):
-    """Single REINFORCE update: compute log_prob of generated tokens, scale by reward.
+def _maac_update(agent, tokenizer, inputs, gen_output, reward):
+    """Single MAAC update: actor loss + critic loss.
 
-    loss = -log_prob(completion|prompt) * reward
+    actor_loss  = -log_prob(completion|prompt) * advantage
+    critic_loss = MSE(value, reward)
+    advantage   = reward - value
+
+    CausalLMWithValueHead.forward() returns both logits and values.
     """
     if reward == 0:
-        return  # nothing to learn
+        return torch.tensor(0.0), 0.0
 
     device = next(agent.parameters()).device
     prompt_len = inputs.input_ids.shape[1]
     completion_ids = gen_output[0][prompt_len:]
+    L = len(completion_ids)
+    if L == 0:
+        return torch.tensor(0.0), 0.0
 
-    if len(completion_ids) == 0:
-        return
-
-    # Forward pass on (prompt + completion) to get logits with gradients
+    # Forward pass with gradients — CausalLMWithValueHead gives logits + values
     full_ids = torch.cat([inputs.input_ids[0], completion_ids]).unsqueeze(0).to(device)
-    outputs = agent(full_ids)
-    # logits at positions predicting each completion token
-    logits = outputs.logits[0, prompt_len - 1 : -1, :]
+    out = agent(full_ids, output_values=True)  # ActorCriticOutput
+
+    # --- Actor loss: -log_prob * advantage ---
+    logits = out.logits[0, prompt_len - 1 : -1, :]
     log_probs = torch.log_softmax(logits, dim=-1)
-    # gather log_prob of actual generated tokens
-    token_lps = log_probs[range(len(completion_ids)), completion_ids.to(device)]
+    token_lps = log_probs[range(L), completion_ids.to(device)]
+    seq_log_prob = token_lps.sum()
 
-    # REINFORCE: negative log likelihood scaled by reward
-    loss = -token_lps.sum() * reward
+    # Advantage = reward - V(s)  where V(s) = value at last prompt position, averaged
+    v_prompt = out.values[0, prompt_len - 1 : prompt_len + L]  # values over prompt tail + completion
+    v_mean = v_prompt.mean() if v_prompt.numel() > 0 else torch.tensor(0.0, device=device)
+    advantage = reward - v_mean.detach()
 
-    optimizer.zero_grad()
+    actor_loss = -seq_log_prob * advantage
+
+    # --- Critic loss: MSE(value, reward) ---
+    reward_t = torch.tensor(reward, device=device, dtype=v_mean.dtype)
+    critic_loss = torch.nn.functional.mse_loss(v_mean, reward_t)
+
+    # --- Combined loss ---
+    loss = actor_loss + 0.6 * critic_loss
     loss.backward()
-    optimizer.step()
+
+    return actor_loss.detach(), critic_loss.item()
 
 
 # ─── Baseline Inference Functions ──────────────────────────────────
