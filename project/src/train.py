@@ -12,7 +12,10 @@ from functools import partial
 from typing import List, Dict, Any, Optional
 
 import torch
-import wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None
 from datasets import load_dataset, Dataset
 from transformers import (
     AutoModelForCausalLM,
@@ -21,7 +24,10 @@ from transformers import (
     TrainingArguments,
 )
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from trl import SFTTrainer
+try:
+    from trl import SFTTrainer
+except ImportError:
+    SFTTrainer = None
 
 
 # ─── Reward Functions ─────────────────────────────────────────────
@@ -393,13 +399,11 @@ def train_collaborative(
             reward = reward_fn([completion_a], [completion_b])[0]
             total_reward += reward
 
-            # Simple REINFORCE-style update
-            for agent, optimizer in zip(agents, optimizers):
-                optimizer.zero_grad()
-                # Use reward as signal (simplified; full MAGRPO does group-relative advantage)
-                loss = torch.tensor(-reward, requires_grad=True).to(agent.device)
-                loss.backward()
-                optimizer.step()
+            # REINFORCE: update Agent A on its own tokens
+            _reinforce_step(agents[0], optimizers[0], tokenizer, inputs_a, out_a, reward)
+
+            # REINFORCE: update Agent B on its own tokens
+            _reinforce_step(agents[1], optimizers[1], tokenizer, inputs_b, out_b, reward)
 
             if (i + 1) % 10 == 0:
                 print(f"  Step {i+1}/{len(dataset)}, avg reward: {total_reward/(i+1):.3f}")
@@ -418,6 +422,99 @@ def train_collaborative(
     agent_b.save_pretrained(final_b)
     print(f"Training complete. Models saved to {final_a} and {final_b}")
     return final_a, final_b
+
+
+# ─── REINFORCE step ────────────────────────────────────────────────
+
+def _reinforce_step(agent, optimizer, tokenizer, inputs, gen_output, reward):
+    """Single REINFORCE update: compute log_prob of generated tokens, scale by reward.
+
+    loss = -log_prob(completion|prompt) * reward
+    """
+    if reward == 0:
+        return  # nothing to learn
+
+    device = next(agent.parameters()).device
+    prompt_len = inputs.input_ids.shape[1]
+    completion_ids = gen_output[0][prompt_len:]
+
+    if len(completion_ids) == 0:
+        return
+
+    # Forward pass on (prompt + completion) to get logits with gradients
+    full_ids = torch.cat([inputs.input_ids[0], completion_ids]).unsqueeze(0).to(device)
+    outputs = agent(full_ids)
+    # logits at positions predicting each completion token
+    logits = outputs.logits[0, prompt_len - 1 : -1, :]
+    log_probs = torch.log_softmax(logits, dim=-1)
+    # gather log_prob of actual generated tokens
+    token_lps = log_probs[range(len(completion_ids)), completion_ids.to(device)]
+
+    # REINFORCE: negative log likelihood scaled by reward
+    loss = -token_lps.sum() * reward
+
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+
+# ─── Baseline Inference Functions ──────────────────────────────────
+
+def single_agent_inference(prompt: str, model, tokenizer, max_tokens=256) -> str:
+    """Single agent does the whole task (B1)."""
+    messages = [
+        {"role": "system", "content": "Write a summary of this Reddit post."},
+        {"role": "user", "content": prompt},
+    ]
+    text = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True,
+    )
+    inputs = tokenizer(text, return_tensors="pt").to(model.device)
+    with torch.no_grad():
+        out = model.generate(**inputs, max_new_tokens=max_tokens, temperature=0.1, do_sample=False)
+    return tokenizer.decode(out[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
+
+
+def parallel_inference(prompt: str, model, tokenizer, max_tokens=256):
+    """Two agents generate independently, no communication (B2)."""
+    a = single_agent_inference(prompt + "\nWrite a one-sentence summary.", model, tokenizer, max_tokens // 2)
+    b = single_agent_inference(prompt + "\nWrite a detailed summary.", model, tokenizer, max_tokens)
+    return a, b
+
+
+def sequential_inference(prompt: str, model, tokenizer, formatter_a, formatter_b, max_tokens=256):
+    """A generates -> B generates based on A, base model (B3)."""
+    prompt_a = formatter_a({"prompt": prompt})
+    inputs_a = tokenizer(prompt_a, return_tensors="pt").to(model.device)
+    with torch.no_grad():
+        out_a = model.generate(**inputs_a, max_new_tokens=max_tokens // 2, temperature=0.1, do_sample=False)
+    completion_a = tokenizer.decode(out_a[0][inputs_a.input_ids.shape[1]:], skip_special_tokens=True)
+    prompt_b = formatter_b({"prompt": prompt}) + f"\n\n[Reference]: {completion_a}"
+    inputs_b = tokenizer(prompt_b, return_tensors="pt").to(model.device)
+    with torch.no_grad():
+        out_b = model.generate(**inputs_b, max_new_tokens=max_tokens, temperature=0.1, do_sample=False)
+    completion_b = tokenizer.decode(out_b[0][inputs_b.input_ids.shape[1]:], skip_special_tokens=True)
+    return completion_a, completion_b
+
+
+def discussion_inference(prompt: str, model, tokenizer, formatter_a, formatter_b, max_tokens=256):
+    """One-round discussion: A -> B comments -> A revises (B4)."""
+    prompt_a = formatter_a({"prompt": prompt})
+    inputs_a = tokenizer(prompt_a, return_tensors="pt").to(model.device)
+    with torch.no_grad():
+        out_a = model.generate(**inputs_a, max_new_tokens=max_tokens // 2, temperature=0.1, do_sample=False)
+    a1 = tokenizer.decode(out_a[0][inputs_a.input_ids.shape[1]:], skip_special_tokens=True)
+    b_prompt = f"Review this summary and suggest improvements:\n{a1}"
+    inputs_b = tokenizer(b_prompt, return_tensors="pt").to(model.device)
+    with torch.no_grad():
+        out_b = model.generate(**inputs_b, max_new_tokens=max_tokens // 2, temperature=0.1, do_sample=False)
+    b_comment = tokenizer.decode(out_b[0][inputs_b.input_ids.shape[1]:], skip_special_tokens=True)
+    revise_prompt = f"Revise your summary based on this feedback:\n{b_comment}"
+    inputs_rev = tokenizer(revise_prompt, return_tensors="pt").to(model.device)
+    with torch.no_grad():
+        out_rev = model.generate(**inputs_rev, max_new_tokens=max_tokens, temperature=0.1, do_sample=False)
+    a_revised = tokenizer.decode(out_rev[0][inputs_rev.input_ids.shape[1]:], skip_special_tokens=True)
+    return a_revised, b_comment
 
 
 # ─── Inference (single-turn collaboration) ────────────────────────
