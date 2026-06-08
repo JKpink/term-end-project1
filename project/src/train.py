@@ -365,6 +365,8 @@ def train_collaborative(
     optimizers = [
         torch.optim.AdamW(a.parameters(), lr=learning_rate) for a in agents
     ]
+    device_a = device_a
+    device_b = next(agents[1].parameters()).device
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -398,7 +400,7 @@ def train_collaborative(
             # --- Batch generate ---
             for d in batch:
                 # Agent A
-                inp_a = tokenizer(d["prompt_a"], return_tensors="pt").to(next(agents[0].parameters()).device)
+                inp_a = tokenizer(d["prompt_a"], return_tensors="pt").to(device_a)
                 with torch.no_grad():
                     out_a = agents[0].generate(
                         **inp_a, max_new_tokens=max_new_tokens,
