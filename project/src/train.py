@@ -432,8 +432,6 @@ def train_collaborative(
                 total_reward += r
 
             # --- MAAC update: actor + critic loss per sample, then step ---
-            batch_actor = torch.tensor(0.0, requires_grad=True)
-            batch_critic = 0.0
 
             for i in range(len(batch)):
                 reward = rewards[i]
@@ -446,9 +444,7 @@ def train_collaborative(
                 actor_b, critic_b = _maac_update(
                     agents[1], tokenizer, tokens_b_list[i][0], tokens_b_list[i][1], reward,
                 )
-                batch_actor = batch_actor + actor_a + actor_b
-                total_actor_loss += (actor_a.item() if isinstance(actor_a, torch.Tensor) else actor_a) + \
-                                    (actor_b.item() if isinstance(actor_b, torch.Tensor) else actor_b)
+                total_actor_loss += actor_a.item() + actor_b.item()
                 total_critic_loss += critic_a + critic_b
 
             # Step after accumulating batch gradients
