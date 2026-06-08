@@ -379,17 +379,21 @@ def train_collaborative(
         })
 
     B = 4  # batch size
+    total_batches = len(formatted_data) // B + (1 if len(formatted_data) % B else 0)
     print(f"Starting MAAC training: {num_epochs} epochs, {len(formatted_data)} samples, batch={B}")
+
+    from tqdm import tqdm
 
     for epoch in range(num_epochs):
         total_reward = 0.0
         total_actor_loss = 0.0
         total_critic_loss = 0.0
-        n_batches = 0
 
-        for start in range(0, len(formatted_data), B):
+        pbar = tqdm(range(0, len(formatted_data), B), desc=f"Epoch {epoch+1}/{num_epochs}",
+                    unit="batch", ncols=120)
+
+        for start in pbar:
             batch = formatted_data[start:start + B]
-            n_batches += 1
             # Zero gradients before batch
             for opt in optimizers:
                 opt.zero_grad()
@@ -451,16 +455,16 @@ def train_collaborative(
             for opt in optimizers:
                 opt.step()
 
-            if n_batches % 10 == 0 or start == 0:
-                avg_r = total_reward / ((start / B + 1) * B) if start > 0 else total_reward / len(batch)
-                print(f"  Batch {n_batches}/{len(formatted_data)//B+1}, "
-                      f"reward={sum(rewards)/len(rewards):.2f}, avg_r={avg_r:.3f}", flush=True)
+            # Update tqdm postfix with current metrics
+            pbar.set_postfix(
+                reward=f"{sum(rewards)/len(rewards):.2f}",
+                avg_r=f"{total_reward / (pbar.n * B):.3f}",
+            )
 
         avg_reward = total_reward / len(formatted_data)
         avg_al = total_actor_loss / max(1, len(formatted_data) * 2)
         avg_cl = total_critic_loss / max(1, len(formatted_data) * 2)
-        print(f"Epoch {epoch+1}/{num_epochs}: avg_reward={avg_reward:.4f}, "
-              f"actor_loss={avg_al:.4f}, critic_loss={avg_cl:.4f}", flush=True)
+        print(f"  ✓ avg_reward={avg_reward:.4f}, actor_loss={avg_al:.4f}, critic_loss={avg_cl:.4f}")
 
         # Save checkpoints
         agent_a.model.save_pretrained(os.path.join(output_dir, f"agent_a_epoch{epoch+1}"))
