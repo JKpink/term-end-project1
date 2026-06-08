@@ -398,7 +398,7 @@ def train_collaborative(
             # --- Batch generate ---
             for d in batch:
                 # Agent A
-                inp_a = tokenizer(d["prompt_a"], return_tensors="pt").to(agents[0].device)
+                inp_a = tokenizer(d["prompt_a"], return_tensors="pt").to(next(agents[0].parameters()).device)
                 with torch.no_grad():
                     out_a = agents[0].generate(
                         **inp_a, max_new_tokens=max_new_tokens,
@@ -410,7 +410,7 @@ def train_collaborative(
 
                 # Agent B
                 full_b = f"{d['prompt_b']}\n\n[Reference]: {text_a}"
-                inp_b = tokenizer(full_b, return_tensors="pt").to(agents[1].device)
+                inp_b = tokenizer(full_b, return_tensors="pt").to(next(agents[1].parameters()).device)
                 with torch.no_grad():
                     out_b = agents[1].generate(
                         **inp_b, max_new_tokens=max_new_tokens,
