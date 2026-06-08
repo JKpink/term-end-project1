@@ -1,36 +1,47 @@
-# Qwen3-VL-2B + LoRA 细粒度食物图像分类
+# 多智能体 LLM 协作写作
 
 ## 项目简介
 
-本项目研究小型视觉语言模型(VLM)的专项能力增强。通过 LoRA 微调 Qwen3-VL-2B（600M参数），使其在细粒度食物分类任务上超越未训练的 4B/8B 大模型。
+探索小模型的能力边界：两个 Qwen3-0.6B 通过角色分工协作，能否超越单个大模型？
 
-**核心叙事**：精准的专才 > 平庸的通才 — 参数少 4 倍，专项能力更强。
+- **Agent A**: 精炼摘要者（提取核心要点，~220字符）
+- **Agent B**: 详细写作者（基于 A 的摘要展开，2-3倍长度）
 
 ## 环境要求
 
 - Python 3.10+
-- CUDA 12.1+
-- RTX 5060 8GB（或以上）
+- Kaggle T4×2（训练）/ RTX 5060 8GB（推理）
 - Windows / Linux
 
 ## 快速开始
 
 ```bash
-# 1. 安装依赖
+# 安装依赖
+cd project
 pip install -r requirements.txt
 
-# 2. 下载模型和数据集
-python prepare.py --target all
+# 本地训练（小规模测试）
+python src/train.py --model_name Qwen/Qwen3-0.6B --dataset_size 50 --num_epochs 1
 
-# 3. 验证安装
-python prepare.py --target verify
+# 本地评测（5 baseline 对比）
+python src/evaluate.py --num_samples 20
 
-# 4. 运行完整实验
-python run.py all
+# Kaggle 训练（完整版）
+# 上传 kaggle_notebook.ipynb，Run All
 
-# 5. 启动 Gradio Demo
-python run.py demo
+# Gradio Demo
+python app/gradio_app.py
 ```
+
+## Baseline 对比
+
+| # | 方法 | 说明 |
+|---|------|------|
+| B1 | Single Model | 单模型完成全部任务 |
+| B2 | Parallel Generation | 两模型独立生成，不通信 |
+| B3 | Sequential Pipeline | A→B 顺序，不训练 |
+| B4 | One-Round Discussion | A 和 B 各说一句话 |
+| **Ours** | **Collaborative** | LoRA 训练角色分工 |
 
 ## 项目结构
 
@@ -38,50 +49,29 @@ python run.py demo
 project/
 ├── README.md
 ├── requirements.txt
-├── prepare.py              # 下载模型+数据集
-├── run.py                  # 实验编排
+├── kaggle_notebook.ipynb     # Kaggle T4×2 训练
+├── run.py                    # 本地实验编排
 ├── src/
-│   ├── data.py             # Food101 数据加载
-│   ├── train.py            # QLoRA 训练
-│   ├── inference.py        # 多模型对比推理
-│   ├── evaluate.py         # 评估指标
-│   └── utils.py            # 工具函数
+│   ├── train.py              # QLoRA + 双Agent协作训练
+│   ├── evaluate.py           # 5 baseline 评测
+│   └── utils.py              # 工具函数
 └── app/
-    └── gradio_app.py       # Web Demo
-```
-
-## Baseline 对比
-
-| 模型 | 参数 | 方式 |
-|------|:---:|------|
-| Qwen3-VL-2B (zero-shot) | 2B | 零样本推理 |
-| Qwen3-VL-4B (zero-shot) | 4B | 零样本推理 |
-| Qwen3-VL-8B (zero-shot) | 8B | 零样本推理 |
-| ResNet-50 (fine-tuned) | 25M | 传统 CNN 微调 |
-| CLIP ViT-B/32 (zero-shot) | 150M | 零样本分类 |
-| **Qwen3-VL-2B + LoRA** | 2B | **我们的方法** |
-
-## 单独运行
-
-```bash
-# 仅训练
-python src/train.py --lora_r 16 --num_classes 20 --max_train_samples 2000
-
-# 仅推理
-python src/inference.py --lora_path ./outputs/lora_food/final
-
-# 仅评估
-python src/evaluate.py --predictions_dir ./outputs/inference
+    └── gradio_app.py         # Web Demo
 ```
 
 ## 训练参数
 
 | 参数 | 值 |
 |------|-----|
-| 模型 | Qwen3-VL-2B-Instruct (4-bit nf4) |
-| LoRA rank | 16 |
-| LoRA alpha | 32 |
-| 学习率 | 2e-4 |
-| Epochs | 2 |
-| Batch size | 1 × grad_accum=8 |
-| 显存峰值 | ~6 GB |
+| 模型 | Qwen3-0.6B (4-bit nf4) |
+| LoRA rank | 8 |
+| LoRA alpha | 16 |
+| 学习率 | 1e-4 |
+| Epochs | 3 |
+| 训练数据 | 320 条 (TLDR) |
+| 显存峰值 | ~4 GB |
+
+## 参考
+
+- CoMLRL: [github.com/OpenMLRL/CoMLRL](https://github.com/OpenMLRL/CoMLRL)
+- 河北师范大学 智能科学综合课程设计五
