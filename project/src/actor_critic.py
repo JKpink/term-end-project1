@@ -86,6 +86,13 @@ class CausalLMWithValueHead(nn.Module):
             if base_params:
                 self.value_head.to(dtype=base_params[0].dtype)
 
+        # Pre-compute device from model parameters (avoids property lookup issues
+        # with nn.Module.__getattr__ in some PyTorch/transformers combinations)
+        try:
+            self._device = next(self.model.parameters()).device
+        except StopIteration:
+            self._device = torch.device("cpu")
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -115,9 +122,19 @@ class CausalLMWithValueHead(nn.Module):
 
     @property
     def device(self):
-        """Proxy device from underlying model."""
-        return next(self.model.parameters()).device
+        """Pre-computed device from model parameters."""
+        return self._device
 
-    def generate(self, *args, **kwargs) -> torch.Tensor:
-        """Proxy generation to underlying causal LM."""
-        return self.model.generate(*args, **kwargs)
+    def generate(self, input_ids=None, attention_mask=None, **kwargs) -> torch.Tensor:
+        """Proxy generation to underlying causal LM.
+
+        Explicitly passes input_ids as the ``inputs`` positional argument so that
+        the internal generate() call uses ``inputs.device`` rather than relying on
+        the wrapping module's ``self.device`` property lookup (which can fail across
+        some PyTorch + transformers + peft version combinations).
+        """
+        # Pop out attention_mask if present so only input_ids goes as positional
+        generate_kwargs = kwargs.copy()
+        if attention_mask is not None:
+            generate_kwargs["attention_mask"] = attention_mask
+        return self.model.generate(input_ids, **generate_kwargs)
