@@ -216,7 +216,7 @@ def load_agent_with_lora(
         device_map=device_map,
         trust_remote_code=True,
         torch_dtype=torch.bfloat16 if not use_4bit else None,
-        attn_implementation="flash_attention_2",
+        attn_implementation="sdpa",  # sdpa = PyTorch内置加速，兼容T4/5060
     )
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
