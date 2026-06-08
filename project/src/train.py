@@ -365,7 +365,7 @@ def train_collaborative(
     optimizers = [
         torch.optim.AdamW(a.parameters(), lr=learning_rate) for a in agents
     ]
-    device_a = device_a
+    device_a = next(agents[0].parameters()).device
     device_b = next(agents[1].parameters()).device
 
     os.makedirs(output_dir, exist_ok=True)
