@@ -113,6 +113,11 @@ class CausalLMWithValueHead(nn.Module):
             hidden_states=outputs.hidden_states,
         )
 
+    @property
+    def device(self):
+        """Proxy device from underlying model."""
+        return next(self.model.parameters()).device
+
     def generate(self, *args, **kwargs) -> torch.Tensor:
         """Proxy generation to underlying causal LM."""
         return self.model.generate(*args, **kwargs)

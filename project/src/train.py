@@ -461,13 +461,13 @@ def train_collaborative(
               f"actor_loss={avg_al:.4f}, critic_loss={avg_cl:.4f}", flush=True)
 
         # Save checkpoints
-        agent_a.save_pretrained(os.path.join(output_dir, f"agent_a_epoch{epoch+1}"))
+        agent_a.model.save_pretrained(os.path.join(output_dir, f"agent_a_epoch{epoch+1}"))
         agent_b.save_pretrained(os.path.join(output_dir, f"agent_b_epoch{epoch+1}"))
 
     # Save final
     final_a = os.path.join(output_dir, "agent_a_final")
     final_b = os.path.join(output_dir, "agent_b_final")
-    agent_a.save_pretrained(final_a)
+    agent_a.model.save_pretrained(final_a)
     agent_b.save_pretrained(final_b)
     print(f"Training complete. Models saved to {final_a} and {final_b}")
     return final_a, final_b
