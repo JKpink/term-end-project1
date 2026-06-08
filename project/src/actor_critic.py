@@ -84,7 +84,10 @@ class CausalLMWithValueHead(nn.Module):
             self.value_head = ValueHead(hidden_size, value_head_hidden_dim)
             base_params = list(base_model.parameters())
             if base_params:
-                self.value_head.to(dtype=base_params[0].dtype)
+                self.value_head = self.value_head.to(
+                    dtype=base_params[0].dtype,
+                    device=base_params[0].device,
+                )
 
         # Pre-compute device from model parameters (avoids property lookup issues
         # with nn.Module.__getattr__ in some PyTorch/transformers combinations)
