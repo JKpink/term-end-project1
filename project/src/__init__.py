@@ -1,1 +1,1 @@
-"""Qwen3-VL LoRA Fine-Grained Food Classification."""
+"""AgentNet-DA: Decentralized Multi-Agent Data Analysis with NL2SQL."""

@@ -1,142 +1,206 @@
-"""
-Gradio Demo: Multi-Agent Collaborative Writing
-
-Side-by-side comparison of 5 methods on the same input.
-"""
+"""AgentNet-DA Gradio Web UI."""
+from __future__ import annotations
 
 import sys
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+import time
+import traceback
 
-import argparse
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
 import gradio as gr
-import torch
-from transformers import AutoTokenizer
 
-from train import (
-    load_agent_with_lora,
-    build_tldr_formatters,
-    collaborative_inference,
-    single_agent_inference as _single,
-    parallel_inference as _parallel,
-    sequential_inference as _sequential,
-    discussion_inference as _discussion,
+from src.config import get_config
+from src.datasource import SQLiteDataSource
+from src.pipeline import (
+    run_single_direct,
+    run_single_cot,
+    run_nl2sql_only,
+    run_2agent_sequential,
+    run_agentnet_dag,
 )
 
-# Cache
-_cache: dict = {}
-
-def load_all(model_name="Qwen/Qwen3-0.6B", lora_path=None):
-    global _cache
-    if _cache:
-        return _cache
-
-    print("Loading models...")
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    base_model, _ = load_agent_with_lora(model_name, use_4bit=True, device_map="auto")
-
-    agent_a = agent_b = base_model
-    if lora_path and os.path.exists(os.path.join(lora_path, "agent_a_final")):
-        from peft import PeftModel
-        agent_a = PeftModel.from_pretrained(base_model, os.path.join(lora_path, "agent_a_final"))
-        agent_b = PeftModel.from_pretrained(base_model, os.path.join(lora_path, "agent_b_final"))
-        agent_a = agent_a.merge_and_unload()
-        agent_b = agent_b.merge_and_unload()
-
-    formatters = build_tldr_formatters(tokenizer)
-    _cache = {
-        "base_model": base_model, "agent_a": agent_a, "agent_b": agent_b,
-        "tokenizer": tokenizer, "formatters": formatters,
-    }
-    print("Models loaded!")
-    return _cache
+DEMO_DB = os.path.join(os.path.dirname(__file__), "..", "data", "campus_trade.db")
 
 
-def compare_all(text):
-    """Run all 5 methods and return results."""
-    m = load_all()
-    tokenizer = m["tokenizer"]
-    fmt = m["formatters"]
+def process_question(question: str, db_path: str, method_choice: str):
+    """Process a question through the selected method(s), yield progress updates."""
+    if not question.strip():
+        yield "请输入问题", "", "", "", ""
+        return
 
-    # B1: Single
-    b1 = _single(text, m["base_model"], tokenizer)
+    if not os.path.exists(db_path):
+        yield f"数据库文件不存在: {db_path}", "", "", "", ""
+        return
 
-    # B2: Parallel
-    b2_a, b2_b = _parallel(text, m["base_model"], tokenizer)
+    db = SQLiteDataSource(db_path)
+    schema_text = db.get_schema_text()
 
-    # B3: Sequential
-    b3_a, b3_b = _sequential(text, m["base_model"], tokenizer, fmt[0], fmt[1])
+    methods = [m.strip() for m in method_choice.split(",")]
+    all_results: dict[str, dict] = {}
 
-    # B4: Discussion
-    b4_a, b4_b = _discussion(text, m["base_model"], tokenizer, fmt[0], fmt[1])
+    for i, method in enumerate(methods):
+        progress = f"({i+1}/{len(methods)}) 运行 {method}..."
 
-    # Ours: Collaborative
-    ours = collaborative_inference(text, m["agent_a"], m["agent_b"], tokenizer, fmt[0], fmt[1])
+        try:
+            if method == "B1":
+                result = run_single_direct(question, schema_text, db)
+            elif method == "B2":
+                result = run_single_cot(question, schema_text, db)
+            elif method == "B3":
+                result = run_nl2sql_only(question, schema_text, db)
+            elif method == "B4":
+                result = run_2agent_sequential(question, schema_text, db)
+            elif method == "Ours":
+                result = run_agentnet_dag(question, schema_text, db)
+            else:
+                continue
 
-    return (
-        b1,
-        f"**Agent A:**\n{b2_a}\n\n**Agent B:**\n{b2_b}",
-        f"**Agent A:**\n{b3_a}\n\n**Agent B:**\n{b3_b}",
-        f"**讨论后输出:**\n{b4_a}\n\n**反馈:**\n{b4_b}",
-        f"**Agent A (精炼):**\n{ours['agent_a']}\n\n**Agent B (展开):**\n{ours['agent_b']}",
-    )
+            all_results[method] = result
+        except Exception as e:
+            all_results[method] = {"error": str(e), "elapsed": 0}
+
+    # Format output
+    progress_text = _format_progress(all_results)
+    sql_text = _format_sql(all_results)
+    data_text = _format_data(all_results)
+    analysis_text = _format_analysis(all_results)
+    report_text = _format_report(all_results)
+
+    yield progress_text, sql_text, data_text, analysis_text, report_text
 
 
-def create_demo(lora_path=None):
-    try:
-        load_all(lora_path=lora_path)
-    except Exception as e:
-        print(f"Models will load on first request: {e}")
+def _format_progress(results: dict) -> str:
+    lines = ["## 执行进度\n"]
+    for method, r in results.items():
+        if r.get("error"):
+            lines.append(f"- **{method}**: ❌ {r['error'][:100]}")
+        else:
+            elapsed = r.get("elapsed", 0)
+            row_count = r.get("row_count", 0)
+            lines.append(f"- **{method}**: ✅ {elapsed:.1f}s | {row_count}行")
+    return "\n".join(lines)
 
-    with gr.Blocks(title="🤖 Multi-Agent Collaborative Writing") as demo:
+
+def _format_sql(results: dict) -> str:
+    lines = ["## SQL\n"]
+    for method, r in results.items():
+        sql = r.get("sql", "")
+        if sql:
+            lines.append(f"### {method}\n```sql\n{sql}\n```\n")
+    return "\n".join(lines)
+
+
+def _format_data(results: dict) -> str:
+    lines = ["## 数据预览\n"]
+    for method, r in results.items():
+        rows = r.get("rows", [])
+        if rows:
+            lines.append(f"### {method} ({len(rows)}行)\n")
+            # Table header
+            cols = list(rows[0].keys())
+            lines.append("| " + " | ".join(cols[:8]) + " |")
+            lines.append("|" + "|".join(["---"] * min(len(cols), 8)) + "|")
+            for row in rows[:10]:
+                vals = [str(row.get(c, ""))[:50] for c in cols[:8]]
+                lines.append("| " + " | ".join(vals) + " |")
+            if len(rows) > 10:
+                lines.append(f"\n*...共{len(rows)}行，仅显示前10行*")
+            lines.append("")
+    if all(not r.get("rows") for r in results.values()):
+        lines.append("*无数据返回*")
+    return "\n".join(lines)
+
+
+def _format_analysis(results: dict) -> str:
+    lines = ["## 分析结果\n"]
+    for method, r in results.items():
+        findings = r.get("findings", [])
+        trends = r.get("trends", "")
+        chart = r.get("chart_type", "")
+        if findings:
+            lines.append(f"### {method}\n")
+            for f in findings:
+                lines.append(f"- {f}")
+            if trends:
+                lines.append(f"\n**趋势**: {trends}")
+            if chart:
+                lines.append(f"\n**图表建议**: {chart} - {r.get('chart_title', '')}")
+            lines.append("")
+    if not any(r.get("findings") for r in results.values()):
+        lines.append("*仅SQL模式无分析结果*")
+    return "\n".join(lines)
+
+
+def _format_report(results: dict) -> str:
+    for r in results.values():
+        report = r.get("report", "")
+        if report:
+            return f"## 分析报告\n\n{report}"
+    return "## 分析报告\n\n*仅全流程方法(B4/Ours)生成报告*"
+
+
+def create_demo():
+    """Create and return the Gradio Blocks app."""
+    with gr.Blocks(
+        title="AgentNet-DA: 多智能体数据分析",
+        theme=gr.themes.Soft(primary_hue="blue"),
+    ) as demo:
         gr.Markdown("""
-        # 🤖 多智能体协作写作 — 小模型大能力
-
-        **研究问题**：两个小模型通过角色分工协作，能否超越单个大模型？
-
-        上传一段文本，对比 **5 种方法** 的输出效果。
+        # 🤖 AgentNet-DA: 多智能体数据分析系统
+        基于 AgentNet (NeurIPS 2025) 的 DAG 去中心化多智能体框架，实现零训练的 NL2SQL 数据分析。
         """)
 
         with gr.Row():
             with gr.Column(scale=1):
-                input_text = gr.Textbox(
-                    label="📝 输入文本",
-                    placeholder="Paste a Reddit post or any long text...",
-                    lines=8,
+                question_input = gr.Textbox(
+                    label="📝 输入问题",
+                    placeholder="例: 计算机学院有多少用户？各学院交易总额排名？",
+                    lines=3,
                 )
-                btn = gr.Button("🚀 对比所有方法", variant="primary")
+                db_input = gr.Textbox(
+                    label="🗄️ 数据库路径",
+                    value=DEMO_DB,
+                )
+                method_choice = gr.Dropdown(
+                    label="⚙️ 方法",
+                    choices=["B1", "B2", "B3", "B4", "Ours", "B1,B2,B3,B4,Ours"],
+                    value="B1,B2,B3,B4,Ours",
+                    multiselect=False,
+                )
+                run_btn = gr.Button("🚀 执行分析", variant="primary")
+
+                gr.Markdown("""
+                ### 方法说明
+                - **B1**: 单模型直接生成SQL
+                - **B2**: 单模型+思维链推理
+                - **B3**: 仅Agent-0 NL2SQL
+                - **B4**: Agent-0→Agent-3 两Agent顺序
+                - **Ours**: 完整4-Agent DAG
+                """)
 
             with gr.Column(scale=2):
                 with gr.Tabs():
-                    with gr.TabItem("B1: Single Model"):
-                        out_b1 = gr.Textbox(label="单模型输出", lines=6)
-                    with gr.TabItem("B2: Parallel"):
-                        out_b2 = gr.Markdown("Waiting...")
-                    with gr.TabItem("B3: Sequential"):
-                        out_b3 = gr.Markdown("Waiting...")
-                    with gr.TabItem("B4: Discussion"):
-                        out_b4 = gr.Markdown("Waiting...")
-                    with gr.TabItem("🔥 Ours: Collaborative"):
-                        out_ours = gr.Markdown("Waiting...")
+                    with gr.TabItem("📊 进度"):
+                        progress_output = gr.Markdown("等待输入...")
+                    with gr.TabItem("💻 SQL"):
+                        sql_output = gr.Markdown("")
+                    with gr.TabItem("📋 数据"):
+                        data_output = gr.Markdown("")
+                    with gr.TabItem("📈 分析"):
+                        analysis_output = gr.Markdown("")
+                    with gr.TabItem("📄 报告"):
+                        report_output = gr.Markdown("")
 
-        btn.click(
-            fn=compare_all,
-            inputs=[input_text],
-            outputs=[out_b1, out_b2, out_b3, out_b4, out_ours],
+        run_btn.click(
+            fn=process_question,
+            inputs=[question_input, db_input, method_choice],
+            outputs=[progress_output, sql_output, data_output, analysis_output, report_output],
         )
 
     return demo
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--lora_path", default="./outputs/collab")
-    parser.add_argument("--port", type=int, default=7860)
-    parser.add_argument("--share", action="store_true")
-    args = parser.parse_args()
-
-    demo = create_demo(args.lora_path)
-    demo.launch(server_name="0.0.0.0", server_port=args.port, share=args.share)
+    demo = create_demo()
+    demo.launch(server_name="0.0.0.0", server_port=7860, share=False)

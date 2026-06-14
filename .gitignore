@@ -4,6 +4,8 @@ __pycache__/
 *.pyc
 *.pyo
 
+/extra/
+
 /project/outputs/
 /project/models/
 /project/data/

@@ -1,1 +1,1 @@
-"""Gradio web demo application."""
+"""AgentNet-DA Gradio Web UI."""
